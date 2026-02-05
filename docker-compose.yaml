@@ -1,0 +1,33 @@
+version: '3.8'
+
+services:
+  neosync:
+    build: .
+    container_name: neosync_server
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      - DB_HOST=db
+      - DB_NAME=neosync
+      - DB_USER=neosync
+      - DB_PASS=neosync_secure_password
+      - NEOSYNC_SECRET=REPLACE_WITH_YOUR_OWN_SECRET_KEY
+    volumes:
+      - ./storage:/app/storage
+    depends_on:
+      - db
+
+  db:
+    image: postgres:15-alpine
+    container_name: neosync_db
+    restart: unless-stopped
+    environment:
+      - POSTGRES_DB=neosync
+      - POSTGRES_USER=neosync
+      - POSTGRES_PASSWORD=neosync_secure_password
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+volumes:
+  postgres_data:
