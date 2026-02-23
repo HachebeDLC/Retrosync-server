@@ -336,10 +336,17 @@ async def download_file(request: Request, current_user = Depends(get_current_use
         
     user_id = current_user['id']
     user_storage = os.path.join(STORAGE_DIR, str(user_id))
-    safe_path = os.path.normpath(os.path.join(user_storage, str(path).lstrip("/\\.")))
+    
+    # Normalize path to match the logic used in /upload
+    clean_path = str(path).lstrip("/\\.")
+    safe_path = os.path.normpath(os.path.join(user_storage, clean_path))
+    
+    logger.info(f"Download request: {path} -> Looking at: {safe_path}")
     
     if not os.path.exists(safe_path):
-        raise HTTPException(status_code=404, detail="File not found")
+        logger.error(f"File not found on disk: {safe_path}")
+        # Check if the user is trying to download with a leading slash that was stripped during upload
+        raise HTTPException(status_code=404, detail=f"File not found: {path}")
         
     try:
         with open(safe_path, "rb") as f:
