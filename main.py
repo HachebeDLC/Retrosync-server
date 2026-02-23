@@ -320,7 +320,7 @@ async def upload_file(request: Request, current_user = Depends(get_current_user)
     conn.commit()
     conn.close()
     
-    logger.info(f"Upload: {path}")
+    logger.info(f"💾 UPLOAD: {path}")
     return {"message": "Saved", "path": path}
 
 @app.post("/api/v1/download")
@@ -337,16 +337,23 @@ async def download_file(request: Request, current_user = Depends(get_current_use
     user_id = current_user['id']
     user_storage = os.path.join(STORAGE_DIR, str(user_id))
     
-    # Normalize path to match the logic used in /upload
+    # Normalize path - be very careful here to match UPLOAD logic
     clean_path = str(path).lstrip("/\\.")
     safe_path = os.path.normpath(os.path.join(user_storage, clean_path))
     
-    logger.info(f"Download request: {path} -> Looking at: {safe_path}")
+    logger.info(f"📥 DOWNLOAD: {path} (Normalized: {safe_path})")
     
     if not os.path.exists(safe_path):
-        logger.error(f"File not found on disk: {safe_path}")
-        # Check if the user is trying to download with a leading slash that was stripped during upload
-        raise HTTPException(status_code=404, detail=f"File not found: {path}")
+        logger.error(f"❌ NOT FOUND: {safe_path}")
+        # List files in the user's storage for debugging
+        if os.path.exists(user_storage):
+             all_files = []
+             for root, dirs, files in os.walk(user_storage):
+                 for f in files:
+                     all_files.append(os.path.relpath(os.path.join(root, f), user_storage))
+             logger.info(f"Available files for user {user_id}: {all_files}")
+        
+        raise HTTPException(status_code=404, detail="File not found on server")
         
     try:
         with open(safe_path, "rb") as f:
@@ -360,8 +367,27 @@ async def download_file(request: Request, current_user = Depends(get_current_use
         return Response(content=decrypted_data, media_type="application/octet-stream")
         
     except Exception as e:
-        logger.error(f"Decrypt error: {e}")
+        logger.error(f"🔓 Decrypt error: {e}")
         raise HTTPException(status_code=500, detail="Decryption failed")
+
+@app.get("/api/v1/debug/storage")
+async def debug_storage(current_user = Depends(get_current_user)):
+    """Debug endpoint to see what's actually on the disk"""
+    user_id = current_user['id']
+    user_storage = os.path.join(STORAGE_DIR, str(user_id))
+    
+    files_on_disk = []
+    if os.path.exists(user_storage):
+        for root, dirs, files in os.walk(user_storage):
+            for f in files:
+                rel = os.path.relpath(os.path.join(root, f), user_storage)
+                files_on_disk.append(rel)
+    
+    return {
+        "user_id": user_id,
+        "storage_path": user_storage,
+        "files": files_on_disk
+    }
 
 @app.get("/api/v1/files")
 async def list_files(current_user = Depends(get_current_user)):
