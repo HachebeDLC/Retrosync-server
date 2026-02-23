@@ -6,7 +6,7 @@ services:
     container_name: neosync_server
     restart: unless-stopped
     ports:
-      - "8000:8000"
+      - "5436:8000"
     environment:
       - DB_HOST=db
       - DB_NAME=neosync
