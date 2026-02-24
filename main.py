@@ -392,21 +392,41 @@ async def debug_storage(current_user = Depends(get_current_user)):
 @app.get("/api/v1/files")
 async def list_files(current_user = Depends(get_current_user)):
     user_id = current_user['id']
+    user_storage = os.path.join(STORAGE_DIR, str(user_id))
+
     conn = get_db_connection()
     c = conn.cursor(cursor_factory=RealDictCursor)
     c.execute("SELECT * FROM files WHERE user_id = %s", (user_id,))
     rows = c.fetchall()
-    conn.close()
     
     file_list = []
+    missing_files = []
+
     for row in rows:
-        file_list.append({
-            "path": row['path'],
-            "filename": row['path'],
-            "size": row['size'],
-            "hash": row['hash'],
-            "updated_at": row['updated_at']
-        })
+        db_path = row['path']
+        clean_path = str(db_path).lstrip("/\\.")
+        safe_path = os.path.normpath(os.path.join(user_storage, clean_path))
+        
+        # Auto-heal: Verify the file actually exists on disk
+        if os.path.exists(safe_path):
+            file_list.append({
+                "path": db_path,
+                "filename": db_path,
+                "size": row['size'],
+                "hash": row['hash'],
+                "updated_at": row['updated_at']
+            })
+        else:
+            logger.warning(f"🧹 Auto-healing: Removing missing phantom file from DB: {db_path}")
+            missing_files.append(db_path)
+
+    # Clean up any phantom files from the database
+    if missing_files:
+        for missing in missing_files:
+            c.execute("DELETE FROM files WHERE user_id = %s AND path = %s", (user_id, missing))
+        conn.commit()
+
+    conn.close()
     return {"files": file_list}
 
 @app.delete("/api/v1/files")
