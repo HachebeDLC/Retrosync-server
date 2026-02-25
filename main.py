@@ -285,6 +285,35 @@ async def upload_file(request: Request, current_user = Depends(get_current_user)
     content = await file.read()
     file_hash = hashlib.md5(content).hexdigest()
     
+    # Get incoming timestamp (optional, defaults to now)
+    try:
+        incoming_updated_at = int(form.get("updated_at") or (time.time() * 1000))
+    except:
+        incoming_updated_at = int(time.time() * 1000)
+
+    # Check for existing file in DB
+    conn = get_db_connection()
+    c = conn.cursor(cursor_factory=RealDictCursor)
+    c.execute("SELECT hash, updated_at FROM files WHERE user_id = %s AND path = %s", (user_id, path))
+    existing = c.fetchone()
+
+    if existing:
+        if existing['hash'] == file_hash:
+            conn.close()
+            return {"message": "Already synced", "path": path}
+        
+        # Conflict detection: If incoming is OLDER than existing, save as conflict file
+        if incoming_updated_at < existing['updated_at']:
+            timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+            path_parts = path.split('.')
+            if len(path_parts) > 1:
+                ext = path_parts[-1]
+                base = ".".join(path_parts[:-1])
+                path = f"{base}.sync-conflict-{timestamp}.{ext}"
+            else:
+                path = f"{path}.sync-conflict-{timestamp}"
+            logger.warning(f"⚠️ CONFLICT: Incoming file is older. Saving as conflict: {path}")
+
     # Encrypt
     key = get_user_encryption_key(user_id)
     fernet = Fernet(key)
@@ -296,8 +325,8 @@ async def upload_file(request: Request, current_user = Depends(get_current_user)
     safe_path = os.path.normpath(os.path.join(user_storage, clean_path))
     os.makedirs(os.path.dirname(safe_path), exist_ok=True)
     
-    # Versioning
-    if os.path.exists(safe_path):
+    # Versioning (only for primary files, not conflict files)
+    if not ".sync-conflict-" in path and os.path.exists(safe_path):
         try:
             for i in range(2, 0, -1):
                 v_src = f"{safe_path}.v{i}"
@@ -310,13 +339,11 @@ async def upload_file(request: Request, current_user = Depends(get_current_user)
         buffer.write(encrypted_content)
         
     # DB Update
-    conn = get_db_connection()
-    c = conn.cursor()
     c.execute('''INSERT INTO files (user_id, path, hash, size, updated_at) 
                  VALUES (%s, %s, %s, %s, %s) 
                  ON CONFLICT(user_id, path) DO UPDATE SET 
                  hash=EXCLUDED.hash, size=EXCLUDED.size, updated_at=EXCLUDED.updated_at''',
-              (user_id, path, file_hash, len(content), int(time.time() * 1000)))
+              (user_id, path, file_hash, len(content), incoming_updated_at))
     conn.commit()
     conn.close()
     
@@ -356,6 +383,14 @@ async def download_file(request: Request, current_user = Depends(get_current_use
         raise HTTPException(status_code=404, detail="File not found on server")
         
     try:
+        conn = get_db_connection()
+        c = conn.cursor(cursor_factory=RealDictCursor)
+        c.execute("SELECT hash FROM files WHERE user_id = %s AND path = %s", (user_id, path))
+        file_row = c.fetchone()
+        conn.close()
+        
+        file_hash = file_row['hash'] if file_row else ""
+
         with open(safe_path, "rb") as f:
             encrypted_data = f.read()
         
@@ -364,7 +399,11 @@ async def download_file(request: Request, current_user = Depends(get_current_use
         decrypted_data = fernet.decrypt(encrypted_data)
         
         from fastapi import Response
-        return Response(content=decrypted_data, media_type="application/octet-stream")
+        return Response(
+            content=decrypted_data, 
+            media_type="application/octet-stream",
+            headers={"x-file-hash": str(file_hash)}
+        )
         
     except Exception as e:
         logger.error(f"🔓 Decrypt error: {e}")
