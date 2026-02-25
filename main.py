@@ -98,9 +98,15 @@ def init_db():
                 hash TEXT,
                 size BIGINT,
                 updated_at BIGINT,
+                blocks TEXT, -- JSON list of block hashes
                 UNIQUE(user_id, path)
             )''')
             
+            # Add blocks column if not exists (migration)
+            try:
+                c.execute("ALTER TABLE files ADD COLUMN IF NOT EXISTS blocks TEXT")
+            except: pass
+
             conn.commit()
             conn.close()
             logger.info("Database initialized successfully.")
@@ -349,6 +355,84 @@ async def upload_file(request: Request, current_user = Depends(get_current_user)
     
     logger.info(f"💾 UPLOAD: {path}")
     return {"message": "Saved", "path": path}
+
+@app.post("/api/v1/blocks/check")
+async def check_blocks(request: Request, current_user = Depends(get_current_user)):
+    try:
+        body = await request.json()
+        path = body.get("path")
+        client_blocks = body.get("blocks", []) # List of hashes
+    except:
+        raise HTTPException(status_code=400, detail="Invalid JSON")
+
+    user_id = current_user['id']
+    conn = get_db_connection()
+    c = conn.cursor(cursor_factory=RealDictCursor)
+    c.execute("SELECT blocks FROM files WHERE user_id = %s AND path = %s", (user_id, path))
+    row = c.fetchone()
+    conn.close()
+
+    server_blocks = json.loads(row['blocks']) if row and row['blocks'] else []
+    
+    missing_indices = []
+    for i, h in enumerate(client_blocks):
+        if i >= len(server_blocks) or server_blocks[i] != h:
+            missing_indices.append(i)
+            
+    return {"missing": missing_indices}
+
+@app.post("/api/v1/upload/block")
+async def upload_block(request: Request, current_user = Depends(get_current_user)):
+    form = await request.form()
+    file = form.get("file")
+    path = form.get("path")
+    index = int(form.get("index", 0))
+    total = int(form.get("total", 1))
+    file_hash = form.get("hash") # Final file hash
+    
+    user_id = current_user['id']
+    user_storage = os.path.join(STORAGE_DIR, str(user_id))
+    clean_path = str(path).lstrip("/\\.")
+    safe_path = os.path.normpath(os.path.join(user_storage, clean_path))
+    temp_path = f"{safe_path}.part"
+    
+    os.makedirs(os.path.dirname(safe_path), exist_ok=True)
+    
+    # Write block to part file
+    content = await file.read()
+    mode = "wb" if index == 0 else "r+b"
+    
+    with open(temp_path, mode if os.path.exists(temp_path) else "wb") as f:
+        f.seek(index * 1024 * 1024) # 1MB blocks
+        f.write(content)
+        
+    # If last block, assemble and encrypt
+    if index == total - 1:
+        with open(temp_path, "rb") as f:
+            full_content = f.read()
+            
+        # Encrypt the whole thing
+        key = get_user_encryption_key(user_id)
+        fernet = Fernet(key)
+        encrypted_content = fernet.encrypt(full_content)
+        
+        with open(safe_path, "wb") as f:
+            f.write(encrypted_content)
+            
+        os.remove(temp_path)
+        
+        # Update DB
+        conn = get_db_connection()
+        c = conn.cursor()
+        c.execute('''INSERT INTO files (user_id, path, hash, size, updated_at) 
+                     VALUES (%s, %s, %s, %s, %s) 
+                     ON CONFLICT(user_id, path) DO UPDATE SET 
+                     hash=EXCLUDED.hash, size=EXCLUDED.size, updated_at=EXCLUDED.updated_at''',
+                  (user_id, path, file_hash, len(full_content), int(time.time() * 1000)))
+        conn.commit()
+        conn.close()
+        
+    return {"message": "Block received"}
 
 @app.post("/api/v1/download")
 async def download_file(request: Request, current_user = Depends(get_current_user)):
