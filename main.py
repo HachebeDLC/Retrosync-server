@@ -15,6 +15,7 @@ from fastapi.security import OAuth2PasswordBearer
 from pydantic import BaseModel
 import uvicorn
 import json
+from contextlib import asynccontextmanager
 
 from passlib.context import CryptContext
 from jose import JWTError, jwt
@@ -44,18 +45,6 @@ logger = logging.getLogger("NeoSync")
 # --- Security ---
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="login")
-
-app = FastAPI(title="NeoSync Server", description="Secure Self-hosted NeoStation Sync Server")
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-os.makedirs(STORAGE_DIR, exist_ok=True)
 
 # --- Database ---
 def get_db_connection():
@@ -113,9 +102,24 @@ def init_db():
             time.sleep(2)
             retries -= 1
 
-@app.on_event("startup")
-async def startup_event():
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup: Initialize DB
     init_db()
+    yield
+    # Shutdown: Add cleanup here if needed
+
+app = FastAPI(title="NeoSync Server", description="Secure Self-hosted NeoStation Sync Server", lifespan=lifespan)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+os.makedirs(STORAGE_DIR, exist_ok=True)
 
 # --- Access Token Helpers ---
 def create_access_token(data: dict):
@@ -427,7 +431,7 @@ async def download_file(request: Request, current_user = Depends(get_current_use
     return Response(content=data, media_type="application/octet-stream", headers={"x-file-hash": row['hash'] if row else ""})
 
 @app.get("/api/v1/files/versions")
-async def get_versions(path: String, current_user = Depends(get_current_user)):
+async def get_versions(path: str, current_user = Depends(get_current_user)):
     user_id = current_user['id']
     user_storage = os.path.join(STORAGE_DIR, str(user_id))
     clean_path = str(path).lstrip("/\\.")
