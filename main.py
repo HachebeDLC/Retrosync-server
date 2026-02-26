@@ -291,11 +291,13 @@ async def upload_file(request: Request, current_user = Depends(get_current_user)
     content = await file.read()
     file_hash = hashlib.md5(content).hexdigest()
     
-    # Get incoming timestamp (optional, defaults to now)
+    # Get incoming metadata
     try:
         incoming_updated_at = int(form.get("updated_at") or (time.time() * 1000))
     except:
         incoming_updated_at = int(time.time() * 1000)
+    
+    is_forced = form.get("force") == "true"
 
     # Check for existing file in DB
     conn = get_db_connection()
@@ -303,7 +305,7 @@ async def upload_file(request: Request, current_user = Depends(get_current_user)
     c.execute("SELECT hash, updated_at FROM files WHERE user_id = %s AND path = %s", (user_id, path))
     existing = c.fetchone()
 
-    if existing:
+    if existing and not is_forced:
         if existing['hash'] == file_hash:
             conn.close()
             return {"message": "Already synced", "path": path}
@@ -319,6 +321,9 @@ async def upload_file(request: Request, current_user = Depends(get_current_user)
             else:
                 path = f"{path}.sync-conflict-{timestamp}"
             logger.warning(f"⚠️ CONFLICT: Incoming file is older. Saving as conflict: {path}")
+
+    if is_forced:
+        logger.info(f"🚀 FORCED UPLOAD: Overwriting {path}")
 
     # Encrypt
     key = get_user_encryption_key(user_id)
