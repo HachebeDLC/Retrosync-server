@@ -9,7 +9,7 @@ from typing import List, Optional
 from datetime import datetime, timedelta
 
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, WebSocket, WebSocketDisconnect, Depends, Header, Request, status
-from fastapi.responses import JSONResponse, FileResponse
+from fastapi.responses import JSONResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordBearer
 from pydantic import BaseModel
@@ -18,7 +18,6 @@ import json
 
 from passlib.context import CryptContext
 from jose import JWTError, jwt
-from cryptography.fernet import Fernet
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from fastapi.exceptions import RequestValidationError
 
@@ -73,14 +72,12 @@ def get_db_connection():
         raise e
 
 def init_db():
-    # Wait for DB to be ready (simple retry logic)
     retries = 5
     while retries > 0:
         try:
             conn = get_db_connection()
             c = conn.cursor()
             
-            # Users Table
             c.execute('''CREATE TABLE IF NOT EXISTS users (
                 id SERIAL PRIMARY KEY,
                 email TEXT UNIQUE NOT NULL,
@@ -90,7 +87,6 @@ def init_db():
                 created_at BIGINT
             )''')
             
-            # Files Table
             c.execute('''CREATE TABLE IF NOT EXISTS files (
                 id SERIAL PRIMARY KEY,
                 user_id INTEGER REFERENCES users(id),
@@ -98,13 +94,14 @@ def init_db():
                 hash TEXT,
                 size BIGINT,
                 updated_at BIGINT,
-                blocks TEXT, -- JSON list of block hashes
+                blocks TEXT,
+                device_name TEXT,
                 UNIQUE(user_id, path)
             )''')
             
-            # Add blocks column if not exists (migration)
             try:
                 c.execute("ALTER TABLE files ADD COLUMN IF NOT EXISTS blocks TEXT")
+                c.execute("ALTER TABLE files ADD COLUMN IF NOT EXISTS device_name TEXT")
             except: pass
 
             conn.commit()
@@ -116,40 +113,16 @@ def init_db():
             time.sleep(2)
             retries -= 1
 
-# Initialize DB on startup
 @app.on_event("startup")
 async def startup_event():
     init_db()
 
-# --- Helpers ---
-def verify_password(plain_password, hashed_password):
-    return pwd_context.verify(plain_password, hashed_password)
-
-def get_password_hash(password):
-    return pwd_context.hash(password)
-
+# --- Access Token Helpers ---
 def create_access_token(data: dict):
     to_encode = data.copy()
     expire = datetime.utcnow() + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
     to_encode.update({"exp": expire})
     return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
-
-def get_user_encryption_key(user_id: int) -> bytes:
-    conn = get_db_connection()
-    c = conn.cursor(cursor_factory=RealDictCursor)
-    c.execute("SELECT encryption_key FROM users WHERE id = %s", (user_id,))
-    row = c.fetchone()
-    
-    if row and row['encryption_key']:
-        conn.close()
-        return row['encryption_key'].encode()
-        
-    # Generate new key
-    key = Fernet.generate_key()
-    c.execute("UPDATE users SET encryption_key = %s WHERE id = %s", (key.decode(), user_id))
-    conn.commit()
-    conn.close()
-    return key
 
 async def get_current_user(token: str = Depends(oauth2_scheme)):
     credentials_exception = HTTPException(
@@ -191,7 +164,7 @@ async def health():
     try:
         conn = get_db_connection()
         conn.close()
-        return {"status": "ok", "version": "3.0.0", "db": "connected"}
+        return {"status": "ok", "version": "4.0.0", "db": "connected", "encryption": "client-side"}
     except:
         return {"status": "error", "db": "disconnected"}
 
@@ -200,11 +173,9 @@ async def register(user: UserRegister):
     conn = get_db_connection()
     c = conn.cursor()
     try:
-        hashed_pw = get_password_hash(user.password)
-        enc_key = Fernet.generate_key().decode()
-        
-        c.execute("INSERT INTO users (email, password_hash, username, encryption_key, created_at) VALUES (%s, %s, %s, %s, %s) RETURNING id",
-                  (user.email, hashed_pw, user.username, enc_key, int(time.time())))
+        hashed_pw = pwd_context.hash(user.password)
+        c.execute("INSERT INTO users (email, password_hash, username, created_at) VALUES (%s, %s, %s, %s) RETURNING id",
+                  (user.email, hashed_pw, user.username, int(time.time())))
         user_id = c.fetchone()[0]
         conn.commit()
         
@@ -224,7 +195,7 @@ async def login(user: LoginRequest):
     row = c.fetchone()
     conn.close()
     
-    if not row or not verify_password(user.password, row['password_hash']):
+    if not row or not pwd_context.verify(user.password, row['password_hash']):
         raise HTTPException(status_code=401, detail="Invalid credentials")
     
     token = create_access_token(data={"sub": str(row['id'])})
@@ -239,13 +210,9 @@ async def auth_me(current_user = Depends(get_current_user)):
         "id": str(current_user['id']),
         "email": current_user['email'],
         "username": current_user['username'],
-        "encryption_key": current_user['encryption_key'],
         "plan_id": "gold",
-        "is_premium": True,
-        "plan": {"id": "gold", "name": "Gold", "maxStorage": 1099511627776, "isPremium": True}
+        "is_premium": True
     }
-
-# --- File Ops ---
 
 @app.post("/api/v1/files/check")
 async def check_files(request: Request, current_user = Depends(get_current_user)):
@@ -259,7 +226,6 @@ async def check_files(request: Request, current_user = Depends(get_current_user)
     
     conn = get_db_connection()
     c = conn.cursor(cursor_factory=RealDictCursor)
-    
     to_upload = []
     
     for item in items:
@@ -267,7 +233,7 @@ async def check_files(request: Request, current_user = Depends(get_current_user)
         client_hash = item.get("hash")
         if not path: continue
         
-        c.execute("SELECT * FROM files WHERE user_id = %s AND path = %s", (user_id, path))
+        c.execute("SELECT hash FROM files WHERE user_id = %s AND path = %s", (user_id, path))
         row = c.fetchone()
         
         if not row or row['hash'] != client_hash:
@@ -275,6 +241,14 @@ async def check_files(request: Request, current_user = Depends(get_current_user)
             
     conn.close()
     return {"upload": to_upload, "download": [], "conflicts": []}
+
+def calculate_blocks(content: bytes) -> List[str]:
+    BLOCK_SIZE = 1024 * 1024 # 1MB
+    hashes = []
+    for i in range(0, len(content), BLOCK_SIZE):
+        chunk = content[i:i + BLOCK_SIZE]
+        hashes.append(hashlib.md5(chunk).hexdigest())
+    return hashes
 
 @app.post("/api/v1/upload")
 async def upload_file(request: Request, current_user = Depends(get_current_user)):
@@ -286,12 +260,12 @@ async def upload_file(request: Request, current_user = Depends(get_current_user)
         raise HTTPException(status_code=422, detail="Missing data")
 
     user_id = current_user['id']
+    device_name = form.get("device_name", "Unknown Device")
     
-    # Read & Hash
     content = await file.read()
     file_hash = hashlib.md5(content).hexdigest()
+    block_hashes = calculate_blocks(content)
     
-    # Get incoming metadata
     try:
         incoming_updated_at = int(form.get("updated_at") or (time.time() * 1000))
     except:
@@ -299,7 +273,6 @@ async def upload_file(request: Request, current_user = Depends(get_current_user)
     
     is_forced = form.get("force") == "true"
 
-    # Check for existing file in DB
     conn = get_db_connection()
     c = conn.cursor(cursor_factory=RealDictCursor)
     c.execute("SELECT hash, updated_at FROM files WHERE user_id = %s AND path = %s", (user_id, path))
@@ -310,51 +283,44 @@ async def upload_file(request: Request, current_user = Depends(get_current_user)
             conn.close()
             return {"message": "Already synced", "path": path}
         
-        # Conflict detection: If incoming is OLDER than existing, save as conflict file
         if incoming_updated_at < existing['updated_at']:
             timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+            device_slug = "".join(x for x in device_name if x.isalnum())
             path_parts = path.split('.')
             if len(path_parts) > 1:
                 ext = path_parts[-1]
                 base = ".".join(path_parts[:-1])
-                path = f"{base}.sync-conflict-{timestamp}.{ext}"
+                path = f"{base}.sync-conflict-{timestamp}-{device_slug}.{ext}"
             else:
-                path = f"{path}.sync-conflict-{timestamp}"
-            logger.warning(f"⚠️ CONFLICT: Incoming file is older. Saving as conflict: {path}")
+                path = f"{path}.sync-conflict-{timestamp}-{device_slug}"
+            logger.warning(f"⚠️ CONFLICT: {path}")
 
-    if is_forced:
-        logger.info(f"🚀 FORCED UPLOAD: Overwriting {path}")
-
-    # Encrypt
-    key = get_user_encryption_key(user_id)
-    fernet = Fernet(key)
-    encrypted_content = fernet.encrypt(content)
-    
-    # Save
+    # No server-side encryption (Zero-Knowledge)
     clean_path = str(path).lstrip("/\\.")
     user_storage = os.path.join(STORAGE_DIR, str(user_id))
     safe_path = os.path.normpath(os.path.join(user_storage, clean_path))
     os.makedirs(os.path.dirname(safe_path), exist_ok=True)
     
-    # Versioning (only for primary files, not conflict files)
     if not ".sync-conflict-" in path and os.path.exists(safe_path):
+        versions_dir = os.path.join(user_storage, ".versions", os.path.dirname(clean_path))
+        os.makedirs(versions_dir, exist_ok=True)
+        version_base_path = os.path.join(versions_dir, os.path.basename(clean_path))
         try:
-            for i in range(2, 0, -1):
-                v_src = f"{safe_path}.v{i}"
-                v_dst = f"{safe_path}.v{i+1}"
-                if os.path.exists(v_src): shutil.copy2(v_src, v_dst)
-            shutil.copy2(safe_path, f"{safe_path}.v1")
-        except: pass
+            for i in range(4, 0, -1):
+                v_src = f"{version_base_path}.v{i}"
+                v_dst = f"{version_base_path}.v{i+1}"
+                if os.path.exists(v_src): shutil.move(v_src, v_dst)
+            shutil.copy2(safe_path, f"{version_base_path}.v1")
+        except Exception as e: logger.error(f"Versioning error: {e}")
 
-    with open(safe_path, "wb") as buffer:
-        buffer.write(encrypted_content)
+    with open(safe_path, "wb") as f:
+        f.write(content)
         
-    # DB Update
-    c.execute('''INSERT INTO files (user_id, path, hash, size, updated_at) 
-                 VALUES (%s, %s, %s, %s, %s) 
+    c.execute('''INSERT INTO files (user_id, path, hash, size, updated_at, device_name, blocks) 
+                 VALUES (%s, %s, %s, %s, %s, %s, %s) 
                  ON CONFLICT(user_id, path) DO UPDATE SET 
-                 hash=EXCLUDED.hash, size=EXCLUDED.size, updated_at=EXCLUDED.updated_at''',
-              (user_id, path, file_hash, len(content), incoming_updated_at))
+                 hash=EXCLUDED.hash, size=EXCLUDED.size, updated_at=EXCLUDED.updated_at, device_name=EXCLUDED.device_name, blocks=EXCLUDED.blocks''',
+              (user_id, path, file_hash, len(content), incoming_updated_at, device_name, json.dumps(block_hashes)))
     conn.commit()
     conn.close()
     
@@ -366,7 +332,7 @@ async def check_blocks(request: Request, current_user = Depends(get_current_user
     try:
         body = await request.json()
         path = body.get("path")
-        client_blocks = body.get("blocks", []) # List of hashes
+        client_blocks = body.get("blocks", [])
     except:
         raise HTTPException(status_code=400, detail="Invalid JSON")
 
@@ -378,12 +344,7 @@ async def check_blocks(request: Request, current_user = Depends(get_current_user
     conn.close()
 
     server_blocks = json.loads(row['blocks']) if row and row['blocks'] else []
-    
-    missing_indices = []
-    for i, h in enumerate(client_blocks):
-        if i >= len(server_blocks) or server_blocks[i] != h:
-            missing_indices.append(i)
-            
+    missing_indices = [i for i, h in enumerate(client_blocks) if i >= len(server_blocks) or server_blocks[i] != h]
     return {"missing": missing_indices}
 
 @app.post("/api/v1/upload/block")
@@ -393,47 +354,35 @@ async def upload_block(request: Request, current_user = Depends(get_current_user
     path = form.get("path")
     index = int(form.get("index", 0))
     total = int(form.get("total", 1))
-    file_hash = form.get("hash") # Final file hash
+    file_hash = form.get("hash")
+    device_name = form.get("device_name", "Unknown Device")
     
     user_id = current_user['id']
     user_storage = os.path.join(STORAGE_DIR, str(user_id))
     clean_path = str(path).lstrip("/\\.")
     safe_path = os.path.normpath(os.path.join(user_storage, clean_path))
     temp_path = f"{safe_path}.part"
-    
     os.makedirs(os.path.dirname(safe_path), exist_ok=True)
     
-    # Write block to part file
     content = await file.read()
-    mode = "wb" if index == 0 else "r+b"
-    
-    with open(temp_path, mode if os.path.exists(temp_path) else "wb") as f:
-        f.seek(index * 1024 * 1024) # 1MB blocks
+    with open(temp_path, "r+b" if os.path.exists(temp_path) else "wb") as f:
+        f.seek(index * 1024 * 1024)
         f.write(content)
         
-    # If last block, assemble and encrypt
     if index == total - 1:
         with open(temp_path, "rb") as f:
             full_content = f.read()
-            
-        # Encrypt the whole thing
-        key = get_user_encryption_key(user_id)
-        fernet = Fernet(key)
-        encrypted_content = fernet.encrypt(full_content)
-        
+        block_hashes = calculate_blocks(full_content)
         with open(safe_path, "wb") as f:
-            f.write(encrypted_content)
-            
+            f.write(full_content)
         os.remove(temp_path)
-        
-        # Update DB
         conn = get_db_connection()
         c = conn.cursor()
-        c.execute('''INSERT INTO files (user_id, path, hash, size, updated_at) 
-                     VALUES (%s, %s, %s, %s, %s) 
+        c.execute('''INSERT INTO files (user_id, path, hash, size, updated_at, device_name, blocks) 
+                     VALUES (%s, %s, %s, %s, %s, %s, %s) 
                      ON CONFLICT(user_id, path) DO UPDATE SET 
-                     hash=EXCLUDED.hash, size=EXCLUDED.size, updated_at=EXCLUDED.updated_at''',
-                  (user_id, path, file_hash, len(full_content), int(time.time() * 1000)))
+                     hash=EXCLUDED.hash, size=EXCLUDED.size, updated_at=EXCLUDED.updated_at, device_name=EXCLUDED.device_name, blocks=EXCLUDED.blocks''',
+                  (user_id, path, file_hash, len(full_content), int(time.time() * 1000), device_name, json.dumps(block_hashes)))
         conn.commit()
         conn.close()
         
@@ -444,6 +393,7 @@ async def download_file(request: Request, current_user = Depends(get_current_use
     try:
         body = await request.json()
         path = body.get("filename") or body.get("path")
+        version = body.get("version") # Optional
     except:
         raise HTTPException(status_code=400, detail="Invalid JSON")
 
@@ -452,76 +402,55 @@ async def download_file(request: Request, current_user = Depends(get_current_use
         
     user_id = current_user['id']
     user_storage = os.path.join(STORAGE_DIR, str(user_id))
-    
-    # Normalize path - be very careful here to match UPLOAD logic
     clean_path = str(path).lstrip("/\\.")
-    safe_path = os.path.normpath(os.path.join(user_storage, clean_path))
     
-    logger.info(f"📥 DOWNLOAD: {path} (Normalized: {safe_path})")
+    if version:
+        versions_dir = os.path.join(user_storage, ".versions", os.path.dirname(clean_path))
+        safe_path = os.path.join(versions_dir, f"{os.path.basename(clean_path)}.v{version}")
+        logger.info(f"📥 DOWNLOAD VERSION {version}: {path}")
+    else:
+        safe_path = os.path.normpath(os.path.join(user_storage, clean_path))
+        logger.info(f"📥 DOWNLOAD: {path}")
     
     if not os.path.exists(safe_path):
-        logger.error(f"❌ NOT FOUND: {safe_path}")
-        # List files in the user's storage for debugging
-        if os.path.exists(user_storage):
-             all_files = []
-             for root, dirs, files in os.walk(user_storage):
-                 for f in files:
-                     all_files.append(os.path.relpath(os.path.join(root, f), user_storage))
-             logger.info(f"Available files for user {user_id}: {all_files}")
+        raise HTTPException(status_code=404, detail="File not found")
         
-        raise HTTPException(status_code=404, detail="File not found on server")
-        
-    try:
-        conn = get_db_connection()
-        c = conn.cursor(cursor_factory=RealDictCursor)
-        c.execute("SELECT hash FROM files WHERE user_id = %s AND path = %s", (user_id, path))
-        file_row = c.fetchone()
-        conn.close()
-        
-        file_hash = file_row['hash'] if file_row else ""
+    conn = get_db_connection()
+    c = conn.cursor(cursor_factory=RealDictCursor)
+    c.execute("SELECT hash FROM files WHERE user_id = %s AND path = %s", (user_id, path))
+    row = c.fetchone()
+    conn.close()
+    
+    with open(safe_path, "rb") as f:
+        data = f.read()
+    
+    return Response(content=data, media_type="application/octet-stream", headers={"x-file-hash": row['hash'] if row else ""})
 
-        with open(safe_path, "rb") as f:
-            encrypted_data = f.read()
-        
-        key = get_user_encryption_key(user_id)
-        fernet = Fernet(key)
-        decrypted_data = fernet.decrypt(encrypted_data)
-        
-        from fastapi import Response
-        return Response(
-            content=decrypted_data, 
-            media_type="application/octet-stream",
-            headers={"x-file-hash": str(file_hash)}
-        )
-        
-    except Exception as e:
-        logger.error(f"🔓 Decrypt error: {e}")
-        raise HTTPException(status_code=500, detail="Decryption failed")
-
-@app.get("/api/v1/debug/storage")
-async def debug_storage(current_user = Depends(get_current_user)):
-    """Debug endpoint to see what's actually on the disk"""
+@app.get("/api/v1/files/versions")
+async def get_versions(path: String, current_user = Depends(get_current_user)):
     user_id = current_user['id']
     user_storage = os.path.join(STORAGE_DIR, str(user_id))
+    clean_path = str(path).lstrip("/\\.")
+    versions_dir = os.path.join(user_storage, ".versions", os.path.dirname(clean_path))
+    version_base_name = os.path.basename(clean_path)
     
-    files_on_disk = []
-    if os.path.exists(user_storage):
-        for root, dirs, files in os.walk(user_storage):
-            for f in files:
-                rel = os.path.relpath(os.path.join(root, f), user_storage)
-                files_on_disk.append(rel)
-    
-    return {
-        "user_id": user_id,
-        "storage_path": user_storage,
-        "files": files_on_disk
-    }
+    versions = []
+    if os.path.exists(versions_dir):
+        for i in range(1, 6):
+            v_path = os.path.join(versions_dir, f"{version_base_name}.v{i}")
+            if os.path.exists(v_path):
+                stat = os.stat(v_path)
+                versions.append({
+                    "version": i,
+                    "size": stat.st_size,
+                    "updated_at": int(stat.st_mtime * 1000)
+                })
+    return {"versions": versions}
 
 @app.get("/api/v1/files")
 async def list_files(current_user = Depends(get_current_user)):
     user_id = current_user['id']
     user_storage = os.path.join(STORAGE_DIR, str(user_id))
-
     conn = get_db_connection()
     c = conn.cursor(cursor_factory=RealDictCursor)
     c.execute("SELECT * FROM files WHERE user_id = %s", (user_id,))
@@ -529,31 +458,17 @@ async def list_files(current_user = Depends(get_current_user)):
     
     file_list = []
     missing_files = []
-
     for row in rows:
         db_path = row['path']
-        clean_path = str(db_path).lstrip("/\\.")
-        safe_path = os.path.normpath(os.path.join(user_storage, clean_path))
-        
-        # Auto-heal: Verify the file actually exists on disk
+        if db_path.startswith((".versions", ".neosync")): continue
+        safe_path = os.path.normpath(os.path.join(user_storage, db_path.lstrip("/\\.")))
         if os.path.exists(safe_path):
-            file_list.append({
-                "path": db_path,
-                "filename": db_path,
-                "size": row['size'],
-                "hash": row['hash'],
-                "updated_at": row['updated_at']
-            })
+            file_list.append({"path": db_path, "filename": db_path, "size": row['size'], "hash": row['hash'], "updated_at": row['updated_at'], "device_name": row['device_name'] or "Unknown Device"})
         else:
-            logger.warning(f"🧹 Auto-healing: Removing missing phantom file from DB: {db_path}")
             missing_files.append(db_path)
-
-    # Clean up any phantom files from the database
     if missing_files:
-        for missing in missing_files:
-            c.execute("DELETE FROM files WHERE user_id = %s AND path = %s", (user_id, missing))
+        for m in missing_files: c.execute("DELETE FROM files WHERE user_id = %s AND path = %s", (user_id, m))
         conn.commit()
-
     conn.close()
     return {"files": file_list}
 
@@ -564,35 +479,16 @@ async def delete_file(request: Request, current_user=Depends(get_current_user)):
         path = body.get("filename") or body.get("path")
     except:
         raise HTTPException(status_code=400, detail="Invalid JSON")
-
-    if not path:
-        raise HTTPException(status_code=400, detail="Path required")
-
     user_id = current_user['id']
     user_storage = os.path.join(STORAGE_DIR, str(user_id))
     safe_path = os.path.normpath(os.path.join(user_storage, str(path).lstrip("/\\.")))
-
-    if os.path.exists(safe_path):
-        os.remove(safe_path)
-
-    # Versioning cleanup
-    for i in range(1, 10):
-        v_path = f"{safe_path}.v{i}"
-        if os.path.exists(v_path):
-            os.remove(v_path)
-
+    if os.path.exists(safe_path): os.remove(safe_path)
     conn = get_db_connection()
     c = conn.cursor()
     c.execute("DELETE FROM files WHERE user_id = %s AND path = %s", (user_id, path))
-    deleted = c.rowcount
     conn.commit()
     conn.close()
-
-    if deleted == 0:
-        raise HTTPException(status_code=404, detail="File not found in database")
-
-    logger.info(f"Deleted: {path}")
-    return {"message": "File deleted successfully"}
+    return {"message": "Deleted"}
 
 @app.get("/api/v1/quota")
 async def get_quota(current_user=Depends(get_current_user)):
@@ -602,39 +498,24 @@ async def get_quota(current_user=Depends(get_current_user)):
     c.execute("SELECT SUM(size) as total_used FROM files WHERE user_id = %s", (user_id,))
     row = c.fetchone()
     conn.close()
-
     total_used = row['total_used'] if row and row['total_used'] else 0
-    max_storage = 1099511627776  # 1TB from auth/me mock
+    return {"used": total_used, "max": 1099511627776, "freeSpace": 1099511627776 - total_used}
 
-    return {
-        "used": total_used,
-        "max": max_storage,
-        "is_exceeded": total_used > max_storage,
-        "freeSpace": max_storage - total_used
-    }
-
-# --- WS ---
 class ConnectionManager:
-    def __init__(self):
-        self.active_connections: List[WebSocket] = []
+    def __init__(self): self.active_connections: List[WebSocket] = []
     async def connect(self, websocket: WebSocket):
         await websocket.accept()
         self.active_connections.append(websocket)
-    def disconnect(self, websocket: WebSocket):
-        self.active_connections.remove(websocket)
+    def disconnect(self, websocket: WebSocket): self.active_connections.remove(websocket)
     async def broadcast(self, message: str):
-        for connection in self.active_connections:
-            await connection.send_text(message)
+        for connection in self.active_connections: await connection.send_text(message)
 
 manager = ConnectionManager()
 @app.websocket("/ws")
 async def ws_endpoint(websocket: WebSocket):
     await manager.connect(websocket)
     try:
-        while True:
-            await websocket.receive_text()
-    except WebSocketDisconnect:
-        manager.disconnect(websocket)
+        while True: await websocket.receive_text()
+    except WebSocketDisconnect: manager.disconnect(websocket)
 
-if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+if __name__ == "__main__": uvicorn.run(app, host="0.0.0.0", port=8000)
