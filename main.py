@@ -267,7 +267,8 @@ async def upload_file(request: Request, current_user = Depends(get_current_user)
     device_name = form.get("device_name", "Unknown Device")
     
     content = await file.read()
-    file_hash = hashlib.md5(content).hexdigest()
+    # Trust the client's hash (original unencrypted hash) if provided
+    file_hash = form.get("hash") or hashlib.md5(content).hexdigest()
     block_hashes = calculate_blocks(content)
     
     try:
@@ -276,6 +277,8 @@ async def upload_file(request: Request, current_user = Depends(get_current_user)
         incoming_updated_at = int(time.time() * 1000)
     
     is_forced = form.get("force") == "true"
+    if is_forced:
+        logger.info(f"🚀 FORCED UPLOAD: {path} from {device_name}")
 
     conn = get_db_connection()
     c = conn.cursor(cursor_factory=RealDictCursor)
@@ -284,6 +287,7 @@ async def upload_file(request: Request, current_user = Depends(get_current_user)
 
     if existing and not is_forced:
         if existing['hash'] == file_hash:
+            logger.info(f"✅ SKIP: {path} (already identical)")
             conn.close()
             return {"message": "Already synced", "path": path}
         
@@ -297,7 +301,7 @@ async def upload_file(request: Request, current_user = Depends(get_current_user)
                 path = f"{base}.sync-conflict-{timestamp}-{device_slug}.{ext}"
             else:
                 path = f"{path}.sync-conflict-{timestamp}-{device_slug}"
-            logger.warning(f"⚠️ CONFLICT: {path}")
+            logger.warning(f"⚠️ CONFLICT: {path} (incoming is older)")
 
     # No server-side encryption (Zero-Knowledge)
     clean_path = str(path).lstrip("/\\.")
@@ -314,6 +318,7 @@ async def upload_file(request: Request, current_user = Depends(get_current_user)
                 v_src = f"{version_base_path}.v{i}"
                 v_dst = f"{version_base_path}.v{i+1}"
                 if os.path.exists(v_src): shutil.move(v_src, v_dst)
+            logger.info(f"🔄 VERSIONING: Backup created for {path}")
             shutil.copy2(safe_path, f"{version_base_path}.v1")
         except Exception as e: logger.error(f"Versioning error: {e}")
 
@@ -328,7 +333,7 @@ async def upload_file(request: Request, current_user = Depends(get_current_user)
     conn.commit()
     conn.close()
     
-    logger.info(f"💾 UPLOAD: {path}")
+    logger.info(f"💾 SAVED: {path} from {device_name} ({len(content)} bytes)")
     return {"message": "Saved", "path": path}
 
 @app.post("/api/v1/blocks/check")
@@ -341,6 +346,7 @@ async def check_blocks(request: Request, current_user = Depends(get_current_user
         raise HTTPException(status_code=400, detail="Invalid JSON")
 
     user_id = current_user['id']
+    logger.info(f"🔎 BLOCK CHECK: {path}")
     conn = get_db_connection()
     c = conn.cursor(cursor_factory=RealDictCursor)
     c.execute("SELECT blocks FROM files WHERE user_id = %s AND path = %s", (user_id, path))
@@ -349,6 +355,7 @@ async def check_blocks(request: Request, current_user = Depends(get_current_user
 
     server_blocks = json.loads(row['blocks']) if row and row['blocks'] else []
     missing_indices = [i for i, h in enumerate(client_blocks) if i >= len(server_blocks) or server_blocks[i] != h]
+    logger.info(f"🔎 BLOCK RESULT: {path} needs {len(missing_indices)}/{len(client_blocks)} blocks")
     return {"missing": missing_indices}
 
 @app.post("/api/v1/upload/block")
@@ -369,11 +376,13 @@ async def upload_block(request: Request, current_user = Depends(get_current_user
     os.makedirs(os.path.dirname(safe_path), exist_ok=True)
     
     content = await file.read()
+    logger.info(f"📦 BLOCK {index}/{total}: {path} from {device_name}")
     with open(temp_path, "r+b" if os.path.exists(temp_path) else "wb") as f:
         f.seek(index * 1024 * 1024)
         f.write(content)
         
     if index == total - 1:
+        logger.info(f"🏁 FINALIZING: {path} (reassembling blocks)")
         with open(temp_path, "rb") as f:
             full_content = f.read()
         block_hashes = calculate_blocks(full_content)
@@ -389,6 +398,7 @@ async def upload_block(request: Request, current_user = Depends(get_current_user
                   (user_id, path, file_hash, len(full_content), int(time.time() * 1000), device_name, json.dumps(block_hashes)))
         conn.commit()
         conn.close()
+        logger.info(f"✅ ASSEMBLED: {path} total {len(full_content)} bytes")
         
     return {"message": "Block received"}
 
@@ -450,6 +460,26 @@ async def get_versions(path: str, current_user = Depends(get_current_user)):
                     "updated_at": int(stat.st_mtime * 1000)
                 })
     return {"versions": versions}
+
+@app.get("/api/v1/maintenance/cleanup")
+async def maintenance_cleanup(current_user = Depends(get_current_user)):
+    user_id = current_user['id']
+    user_storage = os.path.join(STORAGE_DIR, str(user_id))
+    junk_patterns = ["GBA_", "SNES_", "DS_", "PS1_", "PS2_", "mGBA_", "Snes9x_", "PCSX_"]
+    deleted_count = 0
+    if os.path.exists(user_storage):
+        for root, dirs, files in os.walk(user_storage):
+            for f in files:
+                if any(p in f for p in junk_patterns):
+                    os.remove(os.path.join(root, f))
+                    deleted_count += 1
+    if deleted_count > 0:
+        conn = get_db_connection()
+        c = conn.cursor()
+        for p in junk_patterns: c.execute("DELETE FROM files WHERE user_id = %s AND path LIKE %s", (user_id, f"%{p}%"))
+        conn.commit()
+        conn.close()
+    return {"message": f"Purged {deleted_count} files"}
 
 @app.get("/api/v1/files")
 async def list_files(current_user = Depends(get_current_user)):
