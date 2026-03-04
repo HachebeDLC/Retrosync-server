@@ -164,3 +164,4 @@ cython_debug/
 storage/
 __pycache__/
 .venv/
+*.ps2
