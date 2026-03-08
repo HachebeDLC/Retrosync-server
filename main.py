@@ -158,7 +158,9 @@ def init_db():
             c = conn.cursor()
             c.execute('''CREATE TABLE IF NOT EXISTS users (
                 id SERIAL PRIMARY KEY, email TEXT UNIQUE NOT NULL, password_hash TEXT NOT NULL, 
-                username TEXT, encryption_key TEXT, salt TEXT, created_at BIGINT
+                username TEXT, encryption_key TEXT, salt TEXT, 
+                recovery_payload TEXT, recovery_salt TEXT,
+                created_at BIGINT
             )''')
             
             # Migration: Ensure 'salt' column exists for existing tables
@@ -166,6 +168,13 @@ def init_db():
             if not c.fetchone():
                 c.execute("ALTER TABLE users ADD COLUMN salt TEXT")
                 logger.info("📡 Database migrated: added 'salt' column to 'users'")
+
+            # Migration: Ensure recovery columns exist
+            c.execute("SELECT column_name FROM information_schema.columns WHERE table_name='users' AND column_name='recovery_payload'")
+            if not c.fetchone():
+                c.execute("ALTER TABLE users ADD COLUMN recovery_payload TEXT")
+                c.execute("ALTER TABLE users ADD COLUMN recovery_salt TEXT")
+                logger.info("📡 Database migrated: added recovery columns to 'users'")
 
             c.execute('''CREATE TABLE IF NOT EXISTS files (
                 id SERIAL PRIMARY KEY, user_id INTEGER REFERENCES users(id), path TEXT NOT NULL, 
