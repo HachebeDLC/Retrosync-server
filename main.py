@@ -21,6 +21,10 @@ from passlib.context import CryptContext
 from psycopg2 import pool
 from contextlib import contextmanager
 
+# --- Logging ---
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logger = logging.getLogger("VaultSync")
+
 # --- Configuration ---
 SECRET_KEY = os.environ.get("VAULTSYNC_SECRET", "CHANGE_THIS_IN_PROD")
 if SECRET_KEY == "CHANGE_THIS_IN_PROD":
@@ -35,9 +39,6 @@ DB_HOST = os.environ.get("DB_HOST", "db")
 DB_NAME = os.environ.get("DB_NAME", "vaultsync")
 DB_USER = os.environ.get("DB_USER", "vaultsync")
 DB_PASS = os.environ.get("DB_PASS", "vaultsync_password")
-
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-logger = logging.getLogger("VaultSync")
 
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="login")
@@ -171,7 +172,7 @@ app = FastAPI(title="VaultSync Server")
 app.add_middleware(
     CORSMiddleware, 
     allow_origins=["*"], # Still permissive for self-hosted ease, but methods are restricted
-    allow_credentials=True, 
+    allow_credentials=False, 
     allow_methods=["GET", "POST", "DELETE"], 
     allow_headers=["*"]
 )
