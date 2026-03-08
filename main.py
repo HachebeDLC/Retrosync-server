@@ -13,6 +13,9 @@ from fastapi.responses import JSONResponse, Response, FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordBearer
 from starlette.concurrency import run_in_threadpool
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
 from pydantic import BaseModel
 import uvicorn
 import json
@@ -125,6 +128,7 @@ class VersionManager:
         return results
 
 version_manager = VersionManager(STORAGE_DIR)
+limiter = Limiter(key_func=get_remote_address)
 
 # --- Database Connection Pool ---
 try:
@@ -185,6 +189,9 @@ def is_safe_path(user_id: int, path: str) -> bool:
 # ... (VersionManager remains unchanged) ...
 
 app = FastAPI(title="VaultSync Server")
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
 # Restrict CORS to localhost and common local IP ranges if possible, or provide a warning
 app.add_middleware(
     CORSMiddleware, 
@@ -245,7 +252,8 @@ def health_check():
     return {"status": "online", "version": "VaultSync-v1.2-Secure"}
 
 @app.post("/register")
-def register(user: UserRegister):
+@limiter.limit("5/minute")
+def register(request: Request, user: UserRegister):
     hashed_pw = pwd_context.hash(user.password)
     # Generate random 16-byte salt for Zero-Knowledge key derivation
     salt = os.urandom(16).hex()
@@ -265,7 +273,8 @@ def register(user: UserRegister):
             raise HTTPException(status_code=400, detail="User already exists or data invalid")
 
 @app.post("/login")
-def login(credentials: UserLogin):
+@limiter.limit("5/minute")
+def login(request: Request, credentials: UserLogin):
     with get_db() as conn:
         c = conn.cursor(cursor_factory=RealDictCursor)
         c.execute("SELECT * FROM users WHERE email = %s", (credentials.email,))
