@@ -201,11 +201,14 @@ app = FastAPI(title="VaultSync Server")
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
-# Restrict CORS to localhost and common local IP ranges if possible, or provide a warning
+# CORS Configuration
+CORS_ORIGINS = os.environ.get("VAULTSYNC_CORS_ORIGINS", "*").split(",")
+
+# Restrict CORS to specific origins if provided, otherwise fallback to permissive for self-hosters
 app.add_middleware(
     CORSMiddleware, 
-    allow_origins=["*"], # Still permissive for self-hosted ease, but methods are restricted
-    allow_credentials=False, 
+    allow_origins=CORS_ORIGINS,
+    allow_credentials=True if "*" not in CORS_ORIGINS else False, 
     allow_methods=["GET", "POST", "DELETE"], 
     allow_headers=["*"]
 )
