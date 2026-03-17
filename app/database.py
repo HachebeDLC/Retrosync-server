@@ -8,7 +8,7 @@ logger = logging.getLogger("VaultSync")
 
 try:
     db_pool = pool.ThreadedConnectionPool(
-        1, 5, 
+        5, 20, 
         host=DB_HOST, 
         database=DB_NAME, 
         user=DB_USER, 

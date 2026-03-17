@@ -1,7 +1,7 @@
 import os
 import hashlib
 from typing import List
-from .config import BLOCK_SIZE, STORAGE_DIR
+from .config import ENCRYPTED_BLOCK_SIZE, STORAGE_DIR
 
 def calculate_file_hash_and_blocks(file_path: str) -> tuple[str, List[str]]:
     """Single-pass: calculates the full SHA-256 hash and 1MB block hashes."""
@@ -11,7 +11,7 @@ def calculate_file_hash_and_blocks(file_path: str) -> tuple[str, List[str]]:
         return "", []
     with open(file_path, "rb") as file:
         while True:
-            chunk = file.read(BLOCK_SIZE)
+            chunk = file.read(ENCRYPTED_BLOCK_SIZE)
             if not chunk:
                 break
             full_sha256.update(chunk)

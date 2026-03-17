@@ -1,8 +1,11 @@
 import os
 import json
 import logging
+import asyncio
+import aiofiles
+import hashlib
 from typing import List, Optional
-from fastapi import APIRouter, Depends, HTTPException, Request, Response
+from fastapi import APIRouter, Depends, HTTPException, Request, Response, BackgroundTasks
 from fastapi.responses import FileResponse, StreamingResponse
 
 from ..config import STORAGE_DIR, ENCRYPTED_BLOCK_SIZE
@@ -99,9 +102,9 @@ def check_blocks(body: BlockCheckRequest, current_user = Depends(get_current_use
     return {"missing": [i for i, h in enumerate(body.blocks) if i >= len(server_blocks) or server_blocks[i] != h]}
 
 @router.post("/blocks/download")
-def download_blocks(body: BlockDownloadRequest, current_user = Depends(get_current_user)):
+async def download_blocks(body: BlockDownloadRequest, current_user = Depends(get_current_user)):
     """
-    Streams specific blocks of a file based on provided indices.
+    Streams specific blocks of a file based on provided indices. Merges contiguous block reads for performance.
     """
     if not is_safe_path(current_user['id'], body.path):
         raise HTTPException(status_code=403)
@@ -109,14 +112,41 @@ def download_blocks(body: BlockDownloadRequest, current_user = Depends(get_curre
     if not os.path.exists(safe_path):
         raise HTTPException(status_code=404)
 
-    def iter_blocks():
-        with open(safe_path, "rb") as f:
-            for index in body.indices:
-                offset = index * ENCRYPTED_BLOCK_SIZE
-                f.seek(offset)
-                chunk = f.read(ENCRYPTED_BLOCK_SIZE)
-                if chunk:
+    async def iter_blocks():
+        if not body.indices:
+            return
+            
+        # Group contiguous indices
+        sorted_indices = sorted(body.indices)
+        groups = []
+        current_group = [sorted_indices[0]]
+        
+        for i in range(1, len(sorted_indices)):
+            if sorted_indices[i] == current_group[-1] + 1:
+                current_group.append(sorted_indices[i])
+            else:
+                groups.append(current_group)
+                current_group = [sorted_indices[i]]
+        if current_group:
+            groups.append(current_group)
+
+        async with aiofiles.open(safe_path, "rb") as f:
+            for group in groups:
+                start_offset = group[0] * ENCRYPTED_BLOCK_SIZE
+                read_size = len(group) * ENCRYPTED_BLOCK_SIZE
+                
+                await f.seek(start_offset)
+                
+                # Stream the merged group in chunks to avoid blowing up memory if the group is huge
+                bytes_left = read_size
+                chunk_size = 1024 * 1024 * 4  # 4MB max per yield
+                while bytes_left > 0:
+                    chunk = await f.read(min(chunk_size, bytes_left))
+                    if not chunk:
+                        break
                     yield chunk
+                    bytes_left -= len(chunk)
+                    
     return StreamingResponse(iter_blocks(), media_type="application/octet-stream")
 
 @router.post("/upload")
@@ -142,16 +172,43 @@ async def upload_fragment(request: Request, current_user = Depends(get_current_u
             if metadata:
                 version_manager.create_version(user_id, path, metadata['device_name'])
                 
-    with open(safe_path, "r+b" if os.path.exists(safe_path) else "wb") as f:
-        f.seek(offset)
+    hasher = hashlib.sha256()
+    bytes_written = 0
+    
+    # Safely create the file without truncating if it doesn't exist to prevent concurrent upload races
+    if not os.path.exists(safe_path):
+        try:
+            open(safe_path, "a").close()
+        except Exception:
+            pass
+            
+    async with aiofiles.open(safe_path, "r+b") as f:
+        await f.seek(offset)
         async for chunk in request.stream():
-            f.write(chunk)
+            await f.write(chunk)
+            hasher.update(chunk)
+            bytes_written += len(chunk)
+            
+    # For smart delta hashing, if the upload matches a block size, we update the block hash.
+    # If it's a full stream, we'll just fall back to full file hashing in finalize.
+    if bytes_written <= ENCRYPTED_BLOCK_SIZE and bytes_written > 0:
+        block_idx = offset // ENCRYPTED_BLOCK_SIZE
+        block_hash = hasher.hexdigest()
+        with get_db() as conn:
+            metadata = crud.get_file_metadata(conn, user_id, path)
+            if metadata and metadata.get('blocks'):
+                blocks = json.loads(metadata['blocks'])
+                if block_idx < len(blocks):
+                    blocks[block_idx] = block_hash
+                    crud.update_file_sync(conn, user_id, path, metadata['hash'], metadata['size'], metadata['updated_at'], json.dumps(blocks))
+                    conn.commit()
+
     return {"message": "OK"}
 
 @router.post("/upload/finalize")
-def finalize_upload(body: FinalizeRequest, current_user = Depends(get_current_user)):
+async def finalize_upload(body: FinalizeRequest, current_user = Depends(get_current_user)):
     """
-    Finalizes a file upload, calculating its final hash and updating the database manifest.
+    Finalizes a file upload. Avoids reading the whole file if smart delta hashing can be used.
     """
     user_id = current_user['id']
     if not is_safe_path(user_id, body.path):
@@ -160,10 +217,19 @@ def finalize_upload(body: FinalizeRequest, current_user = Depends(get_current_us
     safe_path = os.path.abspath(os.path.join(STORAGE_DIR, str(user_id), body.path.lstrip("/\\")))
     if not os.path.exists(safe_path):
         raise HTTPException(status_code=404)
-        
-    actual_hash, block_hashes = calculate_file_hash_and_blocks(safe_path)
+
+    actual_hash = body.hash
+    block_hashes = []
     
     with get_db() as conn:
+        metadata = crud.get_file_metadata(conn, user_id, body.path)
+        if metadata and metadata.get('blocks'):
+            block_hashes = json.loads(metadata['blocks'])
+            
+        # If it's a completely new file or we don't have blocks, calculate the hard way
+        if not block_hashes:
+            actual_hash, block_hashes = await asyncio.to_thread(calculate_file_hash_and_blocks, safe_path)
+            
         crud.upsert_file_metadata(
             conn, user_id, body.path, actual_hash, 
             body.size or os.path.getsize(safe_path), body.updated_at, 

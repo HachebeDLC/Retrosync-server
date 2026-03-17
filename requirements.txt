@@ -7,3 +7,5 @@ python-jose[cryptography]
 cryptography
 psycopg2-binary
 slowapi
+aiofiles
+cachetools

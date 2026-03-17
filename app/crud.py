@@ -1,5 +1,8 @@
 import time
 from psycopg2.extras import RealDictCursor
+from cachetools import TTLCache
+
+file_metadata_cache = TTLCache(maxsize=10000, ttl=300)
 
 def get_user_by_email(conn, email: str):
     cursor = conn.cursor(cursor_factory=RealDictCursor)
@@ -44,14 +47,22 @@ def list_user_files(conn, user_id: int, prefix: str = None):
     return cursor.fetchall()
 
 def get_file_metadata(conn, user_id: int, path: str):
+    cache_key = f"{user_id}:{path}"
+    if cache_key in file_metadata_cache:
+        return file_metadata_cache[cache_key]
+
     cursor = conn.cursor(cursor_factory=RealDictCursor)
     cursor.execute(
         "SELECT hash, size, updated_at, device_name, blocks FROM files WHERE user_id = %s AND path = %s", 
         (user_id, path)
     )
-    return cursor.fetchone()
+    result = cursor.fetchone()
+    if result:
+        file_metadata_cache[cache_key] = result
+    return result
 
 def upsert_file_metadata(conn, user_id: int, path: str, hash: str, size: int, updated_at: int, device_name: str, blocks_json: str):
+    file_metadata_cache.pop(f"{user_id}:{path}", None)
     cursor = conn.cursor()
     cursor.execute(
         '''INSERT INTO files (user_id, path, hash, size, updated_at, device_name, blocks) 
@@ -63,6 +74,7 @@ def upsert_file_metadata(conn, user_id: int, path: str, hash: str, size: int, up
     )
 
 def update_file_sync(conn, user_id: int, path: str, hash: str, size: int, updated_at: int, blocks_json: str):
+    file_metadata_cache.pop(f"{user_id}:{path}", None)
     cursor = conn.cursor()
     cursor.execute(
         "UPDATE files SET hash=%s, size=%s, updated_at=%s, blocks=%s WHERE user_id=%s AND path=%s", 
