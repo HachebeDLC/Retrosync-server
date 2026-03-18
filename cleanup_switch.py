@@ -16,17 +16,17 @@ def cleanup():
         cursor = conn.cursor()
         
         # 1. Identify polluted records
-        # Specifically targeting paths under 'switch/' that don't start with a Title ID (16 hex chars)
-        # or contain system keywords like 'nand', 'gpu_drivers', 'config', 'Contents'
+        # Targeting paths that don't start with a valid 0100 Title ID, or contain system keywords
         cursor.execute("""
-            DELETE FROM files 
-            WHERE path LIKE 'switch/%%' 
+            SELECT id, user_id, path FROM files 
+            WHERE path LIKE 'switch/%' 
             AND (
-                path LIKE 'switch/nand%%' OR 
-                path LIKE 'switch/config%%' OR 
-                path LIKE 'switch/gpu_drivers%%' OR 
-                path LIKE 'switch/files%%' OR
-                NOT (substring(path from 8) ~ '^[0-9A-Fa-f]{16}')
+                path LIKE 'switch/nand%' OR 
+                path LIKE 'switch/config%' OR 
+                path LIKE 'switch/gpu_drivers%' OR 
+                path LIKE 'switch/files%' OR
+                path LIKE 'switch/0000000000000000%' OR
+                NOT (substring(path from 8) ~ '^0100[0-9A-Fa-f]{12}')
             )
         """)
         
@@ -39,7 +39,7 @@ def cleanup():
             print(f"  🗑️ Deleted DB record: {path}")
             
             # Delete from Filesystem
-            full_path = os.path.join(STORAGE_DIR, str(user_id), path.replace("switch/", "switch/").lstrip("/"))
+            full_path = os.path.join(STORAGE_DIR, str(user_id), path.lstrip("/"))
             if os.path.exists(full_path):
                 if os.path.isfile(full_path):
                     os.remove(full_path)
@@ -54,7 +54,7 @@ def cleanup():
         for user_folder in os.listdir(STORAGE_DIR):
             user_switch_dir = os.path.join(STORAGE_DIR, user_folder, "switch")
             if os.path.exists(user_switch_dir):
-                for system_folder in ["nand", "gpu_drivers", "config", "files"]:
+                for system_folder in ["nand", "gpu_drivers", "config", "files", "0000000000000000"]:
                     polluted_dir = os.path.join(user_switch_dir, system_folder)
                     if os.path.exists(polluted_dir):
                         shutil.rmtree(polluted_dir)
