@@ -53,28 +53,47 @@ def restore_version(body: RestoreRequest, current_user = Depends(get_current_use
             if metadata:
                 version_manager.create_version(user_id, body.path, metadata['device_name'])
         
-        version_manager.restore_version(user_id, body.path, body.version_id)
+        # Get the target version info
+        versions = version_manager.list_versions(user_id, body.path)
+        if body.version <= 0 or body.version > len(versions):
+            raise HTTPException(status_code=404, detail="Version not found")
+            
+        v_info = versions[body.version - 1]
+        v_path = os.path.join(version_manager.get_version_dir(user_id), v_info['filename'])
         
-        # Update metadata to match the restored file
-        user_root = os.path.join(STORAGE_DIR, str(user_id))
-        safe_path = os.path.abspath(os.path.join(user_root, body.path.lstrip("/\\")))
+        # Overwrite the current file
+        safe_path = os.path.abspath(os.path.join(STORAGE_DIR, str(user_id), body.path.lstrip("/\\")))
+        os.makedirs(os.path.dirname(safe_path), exist_ok=True)
+        import shutil
+        shutil.copy2(v_path, safe_path)
         
-        actual_hash, block_hashes = calculate_file_hash_and_blocks(safe_path)
-        
+        # Update metadata in DB
         with get_db() as conn:
-            crud.update_file_sync(
+            actual_hash, block_hashes = calculate_file_hash_and_blocks(safe_path)
+            crud.upsert_file_metadata(
                 conn, user_id, body.path, actual_hash, 
                 os.path.getsize(safe_path), int(os.path.getmtime(safe_path) * 1000), 
-                json.dumps(block_hashes)
+                "Restored", json.dumps(block_hashes)
             )
             conn.commit()
             
-        return {"message": "Success", "hash": actual_hash}
-    except FileNotFoundError:
-        raise HTTPException(status_code=404, detail="Version not found")
+        return {"message": "Restored successfully"}
     except Exception as e:
-        logger.error(f"❌ Restore failed: {e}")
+        logger.error(f"Restore failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+@router.post("/download")
+def download_file(body: FileRequest, current_user = Depends(get_current_user)):
+    """
+    Downloads a full file from the server.
+    """
+    if not is_safe_path(current_user['id'], body.filename):
+        raise HTTPException(status_code=403)
+        
+    safe_path = os.path.abspath(os.path.join(STORAGE_DIR, str(current_user['id']), body.filename.lstrip("/\\")))
+    if not os.path.exists(safe_path):
+        raise HTTPException(status_code=404)
+    return FileResponse(safe_path, media_type="application/octet-stream")
 
 @router.get("/files/manifest")
 def get_file_manifest(path: str, current_user = Depends(get_current_user)):
@@ -150,7 +169,7 @@ async def download_blocks(body: BlockDownloadRequest, current_user = Depends(get
     return StreamingResponse(iter_blocks(), media_type="application/octet-stream")
 
 @router.post("/upload")
-async def upload_fragment(request: Request, current_user = Depends(get_current_user)):
+async def upload_fragment(request: Request, background_tasks: BackgroundTasks, current_user = Depends(get_current_user)):
     """
     Uploads a file fragment at a specific offset. Used for both full uploads and delta patching.
     Requires 'x-vaultsync-path' and 'x-vaultsync-offset' headers.
@@ -165,12 +184,12 @@ async def upload_fragment(request: Request, current_user = Depends(get_current_u
     safe_path = os.path.abspath(os.path.join(STORAGE_DIR, str(user_id), path.lstrip("/\\")))
     os.makedirs(os.path.dirname(safe_path), exist_ok=True)
     
-    # Version before overwrite at offset 0
+    # Priority 4: Move versioning to BackgroundTasks
     if offset == 0 and os.path.exists(safe_path):
         with get_db() as conn:
             metadata = crud.get_file_metadata(conn, user_id, path)
             if metadata:
-                version_manager.create_version(user_id, path, metadata['device_name'])
+                background_tasks.add_task(version_manager.create_version, user_id, path, metadata['device_name'])
                 
     hasher = hashlib.sha256()
     bytes_written = 0
@@ -238,14 +257,26 @@ async def finalize_upload(body: FinalizeRequest, current_user = Depends(get_curr
         conn.commit()
     return {"message": "Success", "hash": actual_hash}
 
-@router.post("/download")
-def download_file(body: FileRequest, current_user = Depends(get_current_user)):
+@router.delete("/files")
+async def delete_file(body: FileRequest, background_tasks: BackgroundTasks, current_user = Depends(get_current_user)):
     """
-    Downloads a full file from the server.
+    Deletes a file and its metadata. A historical version is created before deletion.
     """
-    if not is_safe_path(current_user['id'], body.filename):
+    path = body.filename
+    if not is_safe_path(current_user['id'], path):
         raise HTTPException(status_code=403)
-    safe_path = os.path.abspath(os.path.join(STORAGE_DIR, str(current_user['id']), body.filename.lstrip("/\\")))
-    if not os.path.exists(safe_path):
-        raise HTTPException(status_code=404)
-    return FileResponse(safe_path, media_type="application/octet-stream")
+        
+    user_id = current_user['id']
+    
+    with get_db() as conn:
+        metadata = crud.get_file_metadata(conn, user_id, path)
+        if metadata:
+            background_tasks.add_task(version_manager.create_version, user_id, path, metadata['device_name'])
+        crud.delete_file_metadata(conn, user_id, path)
+        conn.commit()
+        
+    safe_path = os.path.abspath(os.path.join(STORAGE_DIR, str(user_id), path.lstrip("/\\")))
+    if os.path.exists(safe_path):
+        os.remove(safe_path)
+        
+    return {"message": "Deleted"}

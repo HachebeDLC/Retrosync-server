@@ -77,6 +77,8 @@ def init_db():
                     UNIQUE(user_id, path)
                 )
             ''')
+            # Priority 8: Add index for path-prefix queries
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_files_path ON files (path)')
             conn.commit()
             logger.info("✅ Database schema is up to date")
     except Exception as e:
